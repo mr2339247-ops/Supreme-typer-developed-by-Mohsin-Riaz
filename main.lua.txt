@@ -1,0 +1,2502 @@
+require "import"
+import "android.widget.*"
+import "com.androlua.*"
+import "android.content.Intent"
+import "android.net.Uri"
+import "android.speech.*"
+import "android.view.Gravity"
+import "android.view.View"
+import "android.content.Context"
+import "android.speech.tts.TextToSpeech"
+import "android.content.IntentFilter"
+import "android.os.BatteryManager"
+import "java.util.Locale"
+import "java.text.SimpleDateFormat"
+import "java.util.Date"
+import "android.os.Handler"
+import "android.os.Looper"
+import "android.net.ConnectivityManager"
+import "android.net.NetworkCapabilities"
+import "android.os.Build"
+import "java.net.URLEncoder"
+import "java.io.BufferedReader"
+import "java.io.InputStreamReader"
+import "java.net.URL"
+import "java.lang.StringBuilder"
+import "java.lang.Runnable"
+
+-- ============================================
+-- DATA STORAGE
+-- ============================================
+local pref = this.getSharedPreferences("MohsinRiazPref", Context.MODE_PRIVATE)
+local IS_FIRST_TIME = pref.getBoolean("first_time_setup_done", false)
+
+local _MAIN_HEADING = "Developed by Mohsin Riaz"
+local _DEV_L1 = "Contact Developer"
+local _DEV_L2 = "Mohsin Riaz"
+local _PHONE = "923071881947"
+
+local _YT_URL = pref.getString("yt", "https://youtube.com/@techforvi?si=WWPGEmmJ-Lmof3sl")
+local _DESC_TEXT = pref.getString("desc", "Voice Typing Extension for Visually Impaired Users. Multi-AI powered translation with smart punctuation and contextual emojis!")
+
+-- ============================================
+-- MAIN HANDLER & SETTINGS
+-- ============================================
+local mainHandler = Handler(Looper.getMainLooper())
+
+local typingSettings = {
+  announceTypingStart = pref.getBoolean("cfg_announceTypingStart", true),
+  announceTypingEnd = pref.getBoolean("cfg_announceTypingEnd", true)
+}
+
+local englishLevels = {
+  simple = {name = "Simple English", desc = "Basic and easy to understand English"},
+  standard = {name = "Standard English", desc = "Normal everyday English"},
+  modern = {name = "Modern English", desc = "Contemporary English with modern vocabulary"}
+}
+
+local currentLevel = pref.getString("cfg_englishLevel", "standard")
+
+local config = {
+  autoPunc = pref.getBoolean("cfg_autoPunc", true), 
+  readAfterType = pref.getBoolean("cfg_readAfterType", true), 
+  useEmoji = pref.getBoolean("cfg_useEmoji", true),
+  smartContext = pref.getBoolean("cfg_smartContext", true),
+  englishLevel = currentLevel,
+  sourceLang = pref.getString("cfg_sourceLang", "ur"),
+  targetLang = pref.getString("cfg_targetLang", "en"),
+  debugMode = pref.getBoolean("cfg_debugMode", false),
+  aiRewriteEnabled = pref.getBoolean("cfg_aiRewrite", false),
+  useGoogle = pref.getBoolean("cfg_useGoogle", true),
+  useMyMemory = pref.getBoolean("cfg_useMyMemory", true),
+  useMicrosoft = pref.getBoolean("cfg_useMicrosoft", false),
+  useDefault = pref.getBoolean("cfg_useDefault", true),
+  autoSwitch = pref.getBoolean("cfg_autoSwitch", true),
+  grammarFix = pref.getBoolean("cfg_grammarFix", true),
+  spellingFix = pref.getBoolean("cfg_spellingFix", true),
+  wordChecker = pref.getBoolean("cfg_wordChecker", true)
+}
+
+-- ============================================
+-- ✅ 9 LANGUAGES
+-- ============================================
+local translationLangs = {
+  {code = "en", name = "English", androidLocale = "en-US"},
+  {code = "ur", name = "Urdu", androidLocale = "ur-PK"},
+  {code = "hi", name = "Hindi", androidLocale = "hi-IN"},
+  {code = "ar", name = "Arabic", androidLocale = "ar-SA"},
+  {code = "pa", name = "Punjabi", androidLocale = "pa-IN"},
+  {code = "ru", name = "Russian", androidLocale = "ru-RU"},
+  {code = "fr", name = "French", androidLocale = "fr-FR"},
+  {code = "es", name = "Spanish", androidLocale = "es-ES"},
+  {code = "zh-CN", name = "Chinese", androidLocale = "zh-CN"}
+}
+
+local function getLangName(code)
+  for _, l in ipairs(translationLangs) do
+    if l.code == code then return l.name end
+  end
+  return code
+end
+
+local function getAndroidLocale(code)
+  for _, l in ipairs(translationLangs) do
+    if l.code == code then return l.androidLocale end
+  end
+  return "en-US"
+end
+
+-- ============================================
+-- SAFE LOG
+-- ============================================
+local function safeLog(msg)
+  if config.debugMode then
+    pcall(function()
+      if _G.log then _G.log(msg) end
+    end)
+  end
+end
+
+-- ============================================
+-- NETWORK CHECK
+-- ============================================
+local function isNetworkAvailable()
+    local cm = this.getSystemService(Context.CONNECTIVITY_SERVICE)
+    if cm then
+        if Build.VERSION.SDK_INT >= Build.VERSION_CODES.M then
+            local network = cm.getActiveNetwork()
+            if network then
+                local caps = cm.getNetworkCapabilities(network)
+                if caps then
+                    return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) and
+                           caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                end
+            end
+        else
+            local ni = cm.getActiveNetworkInfo()
+            return ni and ni.isConnected()
+        end
+    end
+    return false
+end
+
+-- ============================================
+-- HTTP HELPERS
+-- ============================================
+local function httpGet(url, timeoutMs)
+    timeoutMs = timeoutMs or 5000
+    local result = nil
+    local success = pcall(function()
+        local conn = URL(url).openConnection()
+        conn.setConnectTimeout(timeoutMs)
+        conn.setReadTimeout(timeoutMs)
+        conn.setRequestMethod("GET")
+        conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36")
+        conn.setRequestProperty("Accept", "application/json, text/plain, */*")
+        local responseCode = conn.getResponseCode()
+        if responseCode == 200 then
+            local reader = BufferedReader(InputStreamReader(conn.getInputStream(), "UTF-8"))
+            local sb = StringBuilder()
+            local line = reader.readLine()
+            while line do sb.append(line).append("\n"); line = reader.readLine() end
+            reader.close()
+            result = sb.toString()
+        end
+        conn.disconnect()
+    end)
+    if success then return result end
+    return nil
+end
+
+local function httpPost(url, postData, timeoutMs)
+    timeoutMs = timeoutMs or 5000
+    local result = nil
+    local success = pcall(function()
+        local conn = URL(url).openConnection()
+        conn.setConnectTimeout(timeoutMs)
+        conn.setReadTimeout(timeoutMs)
+        conn.setRequestMethod("POST")
+        conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36")
+        conn.setRequestProperty("Content-Type", "application/json")
+        conn.setDoOutput(true)
+        local os = conn.getOutputStream()
+        local bytes = postData:getBytes("UTF-8")
+        os.write(bytes, 0, #bytes)
+        os.flush()
+        os.close()
+        local responseCode = conn.getResponseCode()
+        if responseCode == 200 then
+            local reader = BufferedReader(InputStreamReader(conn.getInputStream(), "UTF-8"))
+            local sb = StringBuilder()
+            local line = reader.readLine()
+            while line do sb.append(line).append("\n"); line = reader.readLine() end
+            reader.close()
+            result = sb.toString()
+        end
+        conn.disconnect()
+    end)
+    if success then return result end
+    return nil
+end
+
+local function httpGetWithStatus(url, timeoutMs)
+    timeoutMs = timeoutMs or 5000
+    local result = {code = -1, body = nil, error = nil}
+    local success = pcall(function()
+        local conn = URL(url).openConnection()
+        conn.setConnectTimeout(timeoutMs)
+        conn.setReadTimeout(timeoutMs)
+        conn.setRequestMethod("GET")
+        conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36")
+        result.code = conn.getResponseCode()
+        if result.code == 200 then
+            local reader = BufferedReader(InputStreamReader(conn.getInputStream(), "UTF-8"))
+            local sb = StringBuilder()
+            local line = reader.readLine()
+            while line do sb.append(line).append("\n"); line = reader.readLine() end
+            reader.close()
+            result.body = sb.toString()
+        end
+        conn.disconnect()
+    end)
+    if not success then result.error = "Connection failed" end
+    return result
+end
+
+local function urlEncode(text)
+    local ok, enc = pcall(function() return URLEncoder.encode(text, "UTF-8") end)
+    if ok then return enc end
+    return text
+end
+
+-- ============================================
+-- UTF8 Safe Decode
+-- ============================================
+local function decodeUnicode(str)
+    if not str then return str end
+    local ok, result = pcall(function()
+        return str:gsub("\\u(%x%x%x%x)", function(h) 
+            local n = tonumber(h, 16)
+            if n and n > 0 then
+                local ok2, ch = pcall(string.char, n)
+                if ok2 then return ch end
+            end
+            return ""
+        end)
+    end)
+    if ok then return result end
+    return str
+end
+
+-- ============================================
+-- TTS SETUP
+-- ============================================
+local tts
+local ttsReady = false
+tts = TextToSpeech(this, TextToSpeech.OnInitListener{
+  onInit = function(status)
+    if status == TextToSpeech.SUCCESS then 
+      tts.setLanguage(Locale.US)
+      local savedRate = pref.getFloat("cfg_ttsRate", 1.5)
+      local savedPitch = pref.getFloat("cfg_ttsPitch", 1.1)
+      pcall(function() tts.setSpeechRate(savedRate) end)
+      pcall(function() tts.setPitch(savedPitch) end)
+      ttsReady = true
+    end
+  end
+})
+
+local function speak(text)
+  if text and tts and ttsReady then 
+    pcall(function() tts.speak(text, TextToSpeech.QUEUE_FLUSH, nil, nil) end)
+  end
+end
+
+local function announceBatteryAndTime()
+  local date = SimpleDateFormat("dd MMMM yyyy").format(Date())
+  local day = SimpleDateFormat("EEEE").format(Date())
+  local time = SimpleDateFormat("hh:mm a").format(Date())
+  local bs = this.registerReceiver(nil, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+  if bs then
+    local lvl = bs.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+    speak("Today is " .. day .. ", " .. date .. ". Time is " .. time .. ". Battery " .. lvl .. " percent.")
+  else
+    speak("Today is " .. day .. ", " .. date .. ". Time is " .. time)
+  end
+end
+
+-- ============================================
+-- ✅ AI ENGINE 1: GOOGLE (Super Powerful)
+-- ============================================
+local function engineGoogle(text, src, tgt)
+    local url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=" .. src .. "&tl=" .. tgt .. "&dt=t&q=" .. urlEncode(text)
+    local response = httpGet(url, 5000)
+    if not response then return nil end
+    
+    local translated = ""
+    local segmentCount = 0
+    
+    for trans, orig in response:gmatch('%["(.-)","(.-)"') do
+        if trans and trans ~= "" then
+            if not trans:match("^%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x$") then
+                translated = translated .. trans
+                segmentCount = segmentCount + 1
+            end
+        end
+    end
+    
+    if translated ~= "" and segmentCount > 0 then
+        translated = translated:gsub('\\"', '"'):gsub("\\n", " ")
+        translated = decodeUnicode(translated)
+        translated = translated:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+        return translated
+    end
+    return nil
+end
+
+-- ============================================
+-- ✅ AI ENGINE 2: MYMEMORY (Super Powerful)
+-- ============================================
+local function engineMyMemory(text, src, tgt)
+    local url = "https://api.mymemory.translated.net/get?q=" .. urlEncode(text) .. "&langpair=" .. src .. "|" .. tgt
+    local response = httpGet(url, 5000)
+    if not response then return nil end
+    
+    local translated = response:match('"translatedText":"(.-)"')
+    if not translated or translated == "" then return nil end
+    
+    if translated:find("MYMEMORY WARNING") 
+        or translated:find("QUERY LENGTH LIMIT")
+        or translated:find("INVALID")
+        or #translated < 2 then
+        return nil
+    end
+    
+    translated = decodeUnicode(translated)
+    return translated
+end
+
+-- ============================================
+-- ✅ AI ENGINE 3: MICROSOFT (NEW — Unofficial, No API Key)
+-- ============================================
+local function engineMicrosoft(text, src, tgt)
+    local url = "https://edge.microsoft.com/translate/translatetext?from=" .. src .. "&to=" .. tgt
+    local postData = '{"Text":"' .. text:gsub('"', '\\"'):gsub("\n", " ") .. '"}'
+    local response = httpPost(url, postData, 5000)
+    if not response then return nil end
+    
+    local translated = response:match('"translations":%[{"text":"(.-)"')
+    if not translated or translated == "" then
+        translated = response:match('"text":"(.-)"')
+    end
+    
+    if translated and translated ~= "" then
+        translated = decodeUnicode(translated)
+        return translated
+    end
+    return nil
+end
+
+-- ============================================
+-- ✅ SUPER POWERFUL SCORING (12 Levels)
+-- ============================================
+local function scoreTranslation(text, src, tgt, originalText)
+    if not text or text == "" then return -10000 end
+    
+    local score = 0
+    local len = #text
+    local origLen = #(originalText or "")
+    
+    if len < 2 then score = score - 1000 end
+    if len > 3000 then score = score - 200 end
+    
+    if src == "ur" or src == "ar" then
+        local urduCount = 0
+        for _ in text:gmatch("[\216-\219]") do urduCount = urduCount + 1 end
+        if urduCount > 0 then score = score - (urduCount * 50) end
+    elseif src == "hi" then
+        local hindiCount = 0
+        for _ in text:gmatch("[\224-\239]") do hindiCount = hindiCount + 1 end
+        if hindiCount > 0 then score = score - (hindiCount * 50) end
+    end
+    
+    if tgt == "en" then
+        if text:match("%a") then score = score + 200 end
+        
+        local commonWords = {
+            "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+            "have", "has", "had", "do", "does", "did", "will", "would", "shall",
+            "should", "can", "could", "may", "might", "must", "and", "or", "but",
+            "to", "of", "in", "on", "at", "for", "with", "by", "from", "into",
+            "about", "as", "up", "down", "out", "off", "over", "under", "again",
+            "you", "I", "we", "they", "he", "she", "it", "this", "that", "these",
+            "those", "what", "which", "who", "whom", "whose", "where", "when",
+            "why", "how", "not", "no", "yes", "very", "so", "too", "just", "only"
+        }
+        local lower = text:lower()
+        local wordCount = 0
+        for _, w in ipairs(commonWords) do
+            local _, count = lower:gsub("%f[%a]" .. w .. "%f[%A]", "")
+            wordCount = wordCount + count
+        end
+        score = score + (wordCount * 25)
+        
+        local totalWords = 0
+        for _ in text:gmatch("%a+") do totalWords = totalWords + 1 end
+        if totalWords < 2 then score = score - 500 end
+        
+        if text:match("^%u") then score = score + 30 end
+        if text:match("[%.%?!]%s*$") then score = score + 50 end
+        
+    elseif tgt == "ur" or tgt == "ar" then
+        if text:find("[\216-\219]") then score = score + 200 end
+    end
+    
+    if text:find("WARNING") or text:find("LIMIT") or text:find("ERROR") or text:find("INVALID") then 
+        score = score - 5000 
+    end
+    
+    if origLen > 0 and len > 0 then
+        local ratio = len / origLen
+        if ratio >= 0.4 and ratio <= 2.5 then 
+            score = score + 200 
+        elseif ratio < 0.3 or ratio > 3.0 then
+            score = score - 300
+        end
+    end
+    
+    if text:match("(%S+)%s+%1%s+%1") then score = score - 500 end
+    
+    if tgt == "en" then
+        local firstChar = text:sub(1,1)
+        if firstChar:match("%a") and firstChar == firstChar:lower() then
+            score = score - 30
+        end
+    end
+    
+    return score
+end
+
+-- ============================================
+-- ✅ MULTI-AI TRANSLATE (3 Engines + Default Mode)
+-- ============================================
+local function multiAITranslate(text, src, tgt, callback)
+    if not text or text == "" then callback("", "empty"); return end
+    if src == tgt then callback(text, "same_lang"); return end
+    if not isNetworkAvailable() then callback(nil, "no_network"); return end
+    
+    local resGoogle = nil
+    local resMyMemory = nil
+    local resMicrosoft = nil
+    
+    -- ✅ DEFAULT MODE — Teenon engines ek saath
+    if config.useDefault then
+        if config.useGoogle then
+            local ok1, r1 = pcall(engineGoogle, text, src, tgt)
+            if ok1 and r1 and r1 ~= "" then resGoogle = r1 end
+        end
+        
+        if config.useMyMemory then
+            local ok2, r2 = pcall(engineMyMemory, text, src, tgt)
+            if ok2 and r2 and r2 ~= "" then resMyMemory = r2 end
+        end
+        
+        if config.useMicrosoft then
+            local ok3, r3 = pcall(engineMicrosoft, text, src, tgt)
+            if ok3 and r3 and r3 ~= "" then resMicrosoft = r3 end
+        end
+    else
+        -- User ki marzi
+        if config.useGoogle then
+            local ok1, r1 = pcall(engineGoogle, text, src, tgt)
+            if ok1 and r1 and r1 ~= "" then resGoogle = r1 end
+        end
+        
+        if config.useMyMemory then
+            local ok2, r2 = pcall(engineMyMemory, text, src, tgt)
+            if ok2 and r2 and r2 ~= "" then resMyMemory = r2 end
+        end
+        
+        if config.useMicrosoft then
+            local ok3, r3 = pcall(engineMicrosoft, text, src, tgt)
+            if ok3 and r3 and r3 ~= "" then resMicrosoft = r3 end
+        end
+    end
+    
+    -- Best result choose karo
+    local candidates = {}
+    if resGoogle then table.insert(candidates, {text = resGoogle, engine = "Google"}) end
+    if resMyMemory then table.insert(candidates, {text = resMyMemory, engine = "MyMemory"}) end
+    if resMicrosoft then table.insert(candidates, {text = resMicrosoft, engine = "Microsoft"}) end
+    
+    if #candidates == 0 then
+        callback(nil, "all_failed"); return
+    end
+    
+    if #candidates == 1 then
+        callback(candidates[1].text, candidates[1].engine); return
+    end
+    
+    -- Multiple — score compare
+    local best = candidates[1]
+    local bestScore = scoreTranslation(best.text, src, tgt, text)
+    
+    for i = 2, #candidates do
+        local sc = scoreTranslation(candidates[i].text, src, tgt, text)
+        if sc > bestScore + 200 then
+            best = candidates[i]
+            bestScore = sc
+        end
+    end
+    
+    callback(best.text, best.engine .. " (best)")
+end
+
+-- ============================================
+-- CHUNK TRANSLATION
+-- ============================================
+local function chunkedTranslate(text, src, tgt, callback)
+    if not text or text == "" then callback("", "empty"); return end
+    if #text <= 400 then multiAITranslate(text, src, tgt, callback); return end
+    
+    local chunks = {}
+    local sentenceEndings = {".", "!", "?", "۔", "؟", "،", "。", "？", "\n"}
+    local remaining = text
+    
+    while #remaining > 0 do
+        local bestPos = nil
+        for _, endChar in ipairs(sentenceEndings) do
+            local pos = remaining:find(endChar, 1, true)
+            if pos and pos <= 400 and (not bestPos or pos < bestPos) then
+                bestPos = pos
+            end
+        end
+        
+        if not bestPos then
+            if #remaining <= 400 then
+                table.insert(chunks, remaining); remaining = ""
+            else
+                local part = remaining:sub(1, 400)
+                local lastSpace = part:match(".*()%s")
+                if lastSpace and lastSpace > 200 then part = remaining:sub(1, lastSpace - 1) end
+                table.insert(chunks, part)
+                remaining = remaining:sub(#part + 1):gsub("^%s+", "")
+            end
+        else
+            local part = remaining:sub(1, bestPos)
+            table.insert(chunks, part)
+            remaining = remaining:sub(bestPos + 1):gsub("^%s+", "")
+        end
+    end
+    
+    local results = {}
+    local usedEngine = nil
+    
+    for _, chunk in ipairs(chunks) do
+        local chunkResult = nil
+        local chunkEngine = nil
+        multiAITranslate(chunk, src, tgt, function(translated, engine)
+            if translated and translated ~= "" then
+                chunkResult = translated
+                chunkEngine = engine
+            end
+        end)
+        if chunkResult then
+            table.insert(results, chunkResult)
+            if not usedEngine then usedEngine = chunkEngine end
+        else
+            table.insert(results, chunk)
+        end
+    end
+    
+    if #results > 0 then
+        callback(table.concat(results, " "), usedEngine or "Chunked")
+    else
+        callback(nil, "chunked_failed")
+    end
+end
+-- ============================================
+-- 📚 SMART AUTO-LEARNING DICTIONARY
+-- ============================================
+local wordBanks = {
+    ["ur-PK"] = {},
+    ["en-US"] = {},
+    ["hi-IN"] = {},
+    ["pa-IN"] = {},
+    ["ar-SA"] = {}
+}
+
+local translationCache = {}
+
+local function loadDictionary()
+    for lang, _ in pairs(wordBanks) do
+        local saved = pref.getString("dict_" .. lang, "")
+        if saved and saved ~= "" then
+            for pair in saved:gmatch("[^|]+") do
+                local word, meaning = pair:match("^(.-)=(.+)$")
+                if word and meaning then
+                    wordBanks[lang][word] = meaning
+                end
+            end
+        end
+    end
+end
+
+local function saveDictionary(lang)
+    if not wordBanks[lang] then return end
+    local parts = {}
+    for word, meaning in pairs(wordBanks[lang]) do
+        table.insert(parts, word .. "=" .. meaning)
+    end
+    pref.edit().putString("dict_" .. lang, table.concat(parts, "|")).apply()
+end
+
+local function getWordCount(lang)
+    if not wordBanks[lang] then return 0 end
+    local count = 0
+    for _ in pairs(wordBanks[lang]) do count = count + 1 end
+    return count
+end
+
+-- ✅ AUTO-LEARNING (Phrase + Word Level)
+local function autoLearnWords(originalText, translatedText, srcLang, tgtLang)
+    if not originalText or not translatedText then return end
+    
+    local srcClean = originalText:gsub("^%s+", ""):gsub("%s+$", "")
+    local tgtClean = translatedText:gsub("^%s+", ""):gsub("%s+$", "")
+    
+    if #srcClean > 3 and #srcClean < 60 and #tgtClean > 3 and #tgtClean < 100 then
+        if wordBanks[srcLang] and not wordBanks[srcLang][srcClean] then
+            wordBanks[srcLang][srcClean] = tgtClean
+            saveDictionary(srcLang)
+        end
+        if wordBanks[tgtLang] and not wordBanks[tgtLang][tgtClean] then
+            wordBanks[tgtLang][tgtClean] = srcClean
+            saveDictionary(tgtLang)
+        end
+    end
+    
+    local srcWords = {}
+    for w in originalText:gmatch("[^%s%p]+") do
+        table.insert(srcWords, w)
+    end
+    
+    local tgtWords = {}
+    for w in translatedText:gmatch("[^%s%p]+") do
+        table.insert(tgtWords, w)
+    end
+    
+    if #srcWords == #tgtWords and #srcWords > 0 then
+        for i = 1, #srcWords do
+            local srcWord = srcWords[i]
+            local tgtWord = tgtWords[i]
+            if #srcWord > 3 and #tgtWord > 2 then
+                if wordBanks[srcLang] and not wordBanks[srcLang][srcWord] then
+                    wordBanks[srcLang][srcWord] = tgtWord
+                end
+                if wordBanks[tgtLang] and not wordBanks[tgtLang][tgtWord] then
+                    wordBanks[tgtLang][tgtWord] = srcWord
+                end
+            end
+        end
+        saveDictionary(srcLang)
+        saveDictionary(tgtLang)
+    end
+end
+
+-- ✅ DEFAULT DICTIONARY (150+ words)
+local defaultDictionary = {
+    ["السلام"] = "Peace", ["علیکم"] = "be upon you",
+    ["شکریہ"] = "Thank you", ["بہت"] = "very", ["خدا"] = "God",
+    ["حافظ"] = "protector", ["ہاں"] = "yes", ["نہیں"] = "no",
+    ["ٹھیک"] = "okay", ["اچھا"] = "good", ["برا"] = "bad",
+    ["کیوں"] = "why", ["کیسے"] = "how", ["کیا"] = "what",
+    ["کب"] = "when", ["کہاں"] = "where", ["کون"] = "who",
+    ["کتنا"] = "how much", ["میں"] = "I", ["تم"] = "you",
+    ["آپ"] = "you", ["ہم"] = "we", ["وہ"] = "he",
+    ["میرا"] = "my", ["میری"] = "my", ["کر"] = "do",
+    ["کرنا"] = "to do", ["جا"] = "go", ["جانا"] = "to go",
+    ["آ"] = "come", ["آنا"] = "to come", ["دیکھ"] = "see",
+    ["دیکھنا"] = "to see", ["سن"] = "listen", ["بول"] = "speak",
+    ["لکھ"] = "write", ["پڑھ"] = "read", ["کھا"] = "eat",
+    ["پی"] = "drink", ["سو"] = "sleep", ["آج"] = "today",
+    ["کل"] = "tomorrow", ["صبح"] = "morning", ["شام"] = "evening",
+    ["رات"] = "night", ["دن"] = "day", ["اب"] = "now",
+    ["پھر"] = "then", ["بعد"] = "after", ["پہلے"] = "before",
+    ["خوش"] = "happy", ["اداس"] = "sad", ["غصہ"] = "angry",
+    ["محبت"] = "love", ["امید"] = "hope", ["باپ"] = "father",
+    ["ماں"] = "mother", ["بیٹا"] = "son", ["بیٹی"] = "daughter",
+    ["بھائی"] = "brother", ["بہن"] = "sister", ["دوست"] = "friend",
+    ["گھر"] = "home", ["دفتر"] = "office", ["اسکول"] = "school",
+    ["بازار"] = "market", ["پانی"] = "water", ["دودھ"] = "milk",
+    ["چائے"] = "tea", ["روٹی"] = "bread", ["چاول"] = "rice",
+    ["سفید"] = "white", ["کالا"] = "black", ["سرخ"] = "red",
+    ["نیلا"] = "blue", ["سبز"] = "green", ["کھانا"] = "food",
+    ["پیسہ"] = "money", ["وقت"] = "time", ["کام"] = "work",
+    ["سفر"] = "travel", ["نماز"] = "prayer", ["کتاب"] = "book",
+    ["قلم"] = "pen", ["موبائل"] = "mobile", ["کمپیوٹر"] = "computer",
+    ["فون"] = "phone", ["دنیا"] = "world", ["ملک"] = "country",
+    ["شہر"] = "city", ["گاؤں"] = "village", ["راستہ"] = "road",
+    ["استاد"] = "teacher", ["طالب علم"] = "student",
+    ["کمرہ"] = "room", ["دروازہ"] = "door", ["کھڑکی"] = "window",
+    ["کرسی"] = "chair", ["میز"] = "table", ["بستر"] = "bed",
+    ["کپڑا"] = "cloth", ["جوتا"] = "shoe", ["ٹوپی"] = "cap",
+    ["گاڑی"] = "car", ["سائیکل"] = "bicycle", ["ہوائی جہاز"] = "airplane",
+    ["پہاڑ"] = "mountain", ["دریا"] = "river", ["سمندر"] = "sea",
+    ["آسمان"] = "sky", ["زمین"] = "earth", ["چاند"] = "moon",
+    ["سورج"] = "sun", ["ستارہ"] = "star", ["بادل"] = "cloud",
+    ["بارش"] = "rain", ["ہوا"] = "wind", ["آگ"] = "fire"
+}
+
+local function initDefaultDictionary()
+    if not pref.getBoolean("dict_initialized_v7", false) then
+        for word, meaning in pairs(defaultDictionary) do
+            wordBanks["ur-PK"][word] = meaning
+        end
+        saveDictionary("ur-PK")
+        pref.edit().putBoolean("dict_initialized_v7", true).apply()
+    end
+end
+
+loadDictionary()
+initDefaultDictionary()
+
+local literalDictionary = wordBanks["ur-PK"]
+
+-- ============================================
+-- 🔧 MERGED WORDS REPAIR (36 entries)
+-- ============================================
+local mergedWordsDict = {
+    ["wanto"] = "want to", ["wantto"] = "want to", ["haveto"] = "have to",
+    ["gonna"] = "going to", ["gout"] = "go out", ["goout"] = "go out",
+    ["wakeup"] = "wake up", ["getup"] = "get up", ["giveup"] = "give up",
+    ["iam"] = "I am", ["youare"] = "you are", ["weare"] = "we are",
+    ["theyare"] = "they are", ["sheis"] = "she is", ["heis"] = "he is",
+    ["itis"] = "it is", ["iwill"] = "I will", ["youwill"] = "you will",
+    ["whatis"] = "what is", ["whois"] = "who is", ["howis"] = "how is",
+    ["comeon"] = "come on", ["holdon"] = "hold on", ["lookat"] = "look at",
+    ["thankyou"] = "thank you", ["goodmorning"] = "good morning",
+    ["goodnight"] = "good night", ["goodevening"] = "good evening",
+    ["alright"] = "all right", ["everyday"] = "every day",
+    ["maybe"] = "may be", ["anybody"] = "any body", ["somebody"] = "some body",
+    ["anyone"] = "any one", ["someone"] = "some one", ["noone"] = "no one"
+}
+
+local correctWords = {
+    ["another"] = true, ["everyone"] = true, ["anything"] = true,
+    ["something"] = true, ["nothing"] = true, ["everything"] = true,
+    ["anyone"] = true, ["someone"] = true, ["nobody"] = true,
+    ["whatever"] = true
+}
+
+local function repairMergedWords(text)
+    if not text or text == "" then return text end
+    local result = text
+    for merged, fixed in pairs(mergedWordsDict) do
+        if not correctWords[merged] then
+            local pattern = "(%f[%a])" .. merged:gsub("(%W)", "%%%1") .. "(%f[%W])"
+            result = result:gsub(pattern, function(p, s) 
+                return p .. fixed .. s 
+            end)
+        end
+    end
+    return result
+end
+
+-- ============================================
+-- 🔧 APOSTROPHE FIX (35 entries)
+-- ============================================
+local apostropheFix = {
+    ["dont"] = "don't", ["cant"] = "can't", ["wont"] = "won't",
+    ["didnt"] = "didn't", ["doesnt"] = "doesn't", ["isnt"] = "isn't",
+    ["arent"] = "aren't", ["wasnt"] = "wasn't", ["werent"] = "weren't",
+    ["havent"] = "haven't", ["hasnt"] = "hasn't", ["hadnt"] = "hadn't",
+    ["wouldnt"] = "wouldn't", ["shouldnt"] = "shouldn't", ["couldnt"] = "couldn't",
+    ["im"] = "I'm", ["ive"] = "I've", ["ill"] = "I'll", ["id"] = "I'd",
+    ["youre"] = "you're", ["youve"] = "you've", ["youll"] = "you'll",
+    ["hes"] = "he's", ["shes"] = "she's", ["its"] = "it's", 
+    ["thats"] = "that's", ["whats"] = "what's", ["wheres"] = "where's",
+    ["lets"] = "let's", ["were"] = "we're", ["theyre"] = "they're",
+    ["theres"] = "there's", ["heres"] = "here's", ["whos"] = "who's"
+}
+
+local function fixApostrophes(text)
+    if not text or text == "" then return text end
+    local result = text
+    for wrong, correct in pairs(apostropheFix) do
+        local pattern = "(%f[%a])" .. wrong .. "(%f[%W])"
+        result = result:gsub(pattern, function(p, s)
+            return p .. correct .. s
+        end)
+    end
+    return result
+end
+
+-- ============================================
+-- 🔧 SMART SPACE INSERTION
+-- ============================================
+local spaceExceptions = {
+    ["iPhone"] = true, ["iPad"] = true, ["YouTube"] = true, ["WhatsApp"] = true,
+    ["Facebook"] = true, ["Instagram"] = true, ["TikTok"] = true,
+    ["JavaScript"] = true, ["GitHub"] = true, ["OpenAI"] = true, ["ChatGPT"] = true,
+    ["Android"] = true, ["Google"] = true, ["Windows"] = true, ["LinkedIn"] = true,
+    ["Twitter"] = true, ["Snapchat"] = true, ["Telegram"] = true
+}
+
+local function smartSpaceInsertion(text)
+    if not text or text == "" then return text end
+    local result = text
+    result = result:gsub("(%l)(%u)", function(lower, upper)
+        return lower .. " " .. upper
+    end)
+    for brand, _ in pairs(spaceExceptions) do
+        local broken = brand:gsub("(%u)", " %1"):gsub("^%s+", "")
+        result = result:gsub(broken, brand)
+    end
+    return result
+end
+
+-- ============================================
+-- 🧠 SMART CONTEXT — Duplicate Cleaner
+-- ============================================
+local function cleanDuplicates(text)
+    if not text then return text end
+    text = text:gsub("%f[%a](%S+)%s+%1%f[%A]", "%1")
+    text = text:gsub("%s+", " ")
+    text = text:gsub("^%s+", "")
+    text = text:gsub("%s+$", "")
+    return text
+end
+
+-- ============================================
+-- 🔤 SPELLING FIX (4 Languages)
+-- ============================================
+local urduSpellingFix = {
+    ["وه"] = "وہ", ["هے"] = "ہے", ["هیں"] = "ہیں",
+    ["هو"] = "ہو", ["هوں"] = "ہوں", ["هوا"] = "ہوا",
+    ["هوگا"] = "ہوگا", ["هی"] = "ہی", ["كي"] = "کی",
+    ["ميں"] = "میں", ["نهيں"] = "نہیں", ["تها"] = "تھا",
+    ["كيا"] = "کیا", ["كيوں"] = "کیوں", ["كيسے"] = "کیسے",
+    ["كون"] = "کون", ["يه"] = "یہ", ["نهیں"] = "نہیں",
+    ["كه"] = "کہ", ["بھى"] = "بھی"
+}
+
+local hindiSpellingFix = {
+    ["हे"] = "है", ["होे"] = "हो", ["हू"] = "हूँ",
+    ["थाआ"] = "था", ["थीी"] = "थी", ["औरर"] = "और",
+    ["नही"] = "नहीं", ["हॅ"] = "है", ["कीी"] = "की"
+}
+
+local arabicSpellingFix = {
+    ["ةة"] = "ة", ["يي"] = "ي", ["اا"] = "ا",
+    ["وو"] = "و", ["لل"] = "ل", ["مم"] = "م"
+}
+
+local englishSpellingFix = {
+    ["teh"] = "the", ["tehre"] = "their", ["recieve"] = "receive",
+    ["adn"] = "and", ["tehn"] = "then", ["waht"] = "what",
+    ["wich"] = "which", ["whta"] = "what", ["jsut"] = "just",
+    ["tihs"] = "this", ["fo"] = "of", ["taht"] = "that",
+    ["beacuse"] = "because", ["befoer"] = "before", ["exmaple"] = "example",
+    ["freind"] = "friend", ["grat"] = "great", ["mkae"] = "make",
+    ["sucess"] = "success", ["tkae"] = "take", ["wrok"] = "work"
+}
+
+local englishContextFix = {
+    ["%f[%a]i%f[%A]"] = "I",
+    ["%f[%a]ur%f[%A]"] = "your",
+    ["%f[%a]u%f[%A]"] = "you",
+    ["%f[%a]plz%f[%A]"] = "please",
+    ["%f[%a]thx%f[%A]"] = "thanks",
+    ["%f[%a]ok%f[%A]"] = "okay"
+}
+
+-- ============================================
+-- ✅ WORD CHECKER (NEW — Sirf Galat Words Fix)
+-- ============================================
+local wordCheckerDict = {
+    -- Common misspellings (only fix if wrong)
+    ["teh"] = "the", ["adn"] = "and", ["recieve"] = "receive",
+    ["wich"] = "which", ["waht"] = "what", ["taht"] = "that",
+    ["beacuse"] = "because", ["freind"] = "friend", ["mkae"] = "make",
+    ["sucess"] = "success", ["tkae"] = "take", ["wrok"] = "work",
+    ["jsut"] = "just", ["tihs"] = "this", ["whta"] = "what",
+    ["tehn"] = "then", ["fo"] = "of", ["tehre"] = "their",
+    ["grat"] = "great", ["exmaple"] = "example", ["befoer"] = "before"
+}
+
+-- Valid English words (never change these)
+local validEnglishWords = {
+    ["side"] = true, ["poetry"] = true, ["poem"] = true, ["said"] = true,
+    ["sad"] = true, ["said"] = true, ["poultry"] = true, ["role"] = true,
+    ["roll"] = true, ["their"] = true, ["there"] = true, ["they're"] = true,
+    ["to"] = true, ["too"] = true, ["two"] = true, ["your"] = true,
+    ["you're"] = true, ["its"] = true, ["it's"] = true, ["then"] = true,
+    ["than"] = true, ["affect"] = true, ["effect"] = true, ["lose"] = true,
+    ["loose"] = true, ["accept"] = true, ["except"] = true
+}
+
+local function applyWordChecker(text)
+    if not text or text == "" then return text end
+    if not config.wordChecker then return text end
+    
+    local result = text
+    local words = {}
+    for word in result:gmatch("%S+") do
+        table.insert(words, word)
+    end
+    
+    local fixed = {}
+    for _, word in ipairs(words) do
+        local lower = word:lower()
+        local punct = ""
+        local clean = lower:gsub("^%W+", ""):gsub("%W+$", "")
+        if clean ~= lower then punct = lower:match("%W+$") or ""; lower = clean end
+        
+        -- Check if valid English word
+        if validEnglishWords[lower] then
+            table.insert(fixed, word)  -- Keep as is
+        elseif wordCheckerDict[lower] then
+            -- Fix only if wrong
+            local rep = wordCheckerDict[lower]
+            if word:sub(1,1):match("%u") then 
+                rep = rep:sub(1,1):upper() .. rep:sub(2) 
+            end
+            table.insert(fixed, rep .. punct)
+        else
+            table.insert(fixed, word)  -- Keep as is
+        end
+    end
+    
+    return table.concat(fixed, " ")
+end
+
+-- ============================================
+-- ✅ SUPER POWERFUL GRAMMAR ENGINE (60+ Rules)
+-- ============================================
+local grammarRules = {
+    ["it's translating"] = "its translation",
+    ["it's meaning"] = "its meaning",
+    ["it's performance"] = "its performance",
+    ["it's purpose"] = "its purpose",
+    ["it's function"] = "its function",
+    ["it's name"] = "its name",
+    ["it's color"] = "its color",
+    ["it's value"] = "its value",
+    ["it's role"] = "its role",
+    ["it's type"] = "its type",
+    
+    ["i is"] = "I am",
+    ["i are"] = "I am",
+    ["i were"] = "I was",
+    ["i has"] = "I have",
+    ["i does"] = "I do",
+    
+    ["he are"] = "he is",
+    ["he were"] = "he was",
+    ["he have"] = "he has",
+    ["he do"] = "he does",
+    ["he don't"] = "he doesn't",
+    
+    ["she are"] = "she is",
+    ["she were"] = "she was",
+    ["she have"] = "she has",
+    ["she do"] = "she does",
+    ["she don't"] = "she doesn't",
+    
+    ["it are"] = "it is",
+    ["it were"] = "it was",
+    ["it have"] = "it has",
+    ["it do"] = "it does",
+    ["it don't"] = "it doesn't",
+    
+    ["they is"] = "they are",
+    ["they was"] = "they were",
+    ["they has"] = "they have",
+    ["they does"] = "they do",
+    
+    ["we is"] = "we are",
+    ["we was"] = "we were",
+    ["we has"] = "we have",
+    ["we does"] = "we do",
+    
+    ["you is"] = "you are",
+    ["you was"] = "you were",
+    ["you has"] = "you have",
+    ["you does"] = "you do",
+    
+    ["people is"] = "people are",
+    ["people was"] = "people were",
+    ["children is"] = "children are",
+    ["children was"] = "children were",
+    ["men is"] = "men are",
+    ["men was"] = "men were",
+    ["women is"] = "women are",
+    ["women was"] = "women were",
+    
+    ["a apple"] = "an apple",
+    ["a orange"] = "an orange",
+    ["a egg"] = "an egg",
+    ["a hour"] = "an hour",
+    ["a honest"] = "an honest",
+    ["a umbrella"] = "an umbrella",
+    ["an banana"] = "a banana",
+    ["an cat"] = "a cat",
+    ["an dog"] = "a dog",
+    ["an book"] = "a book",
+    ["an table"] = "a table",
+    
+    ["dont know"] = "don't know",
+    ["doesnt matter"] = "doesn't matter",
+    ["didnt go"] = "didn't go",
+    ["cant do"] = "can't do",
+    ["wont work"] = "won't work",
+    ["isnt here"] = "isn't here",
+    ["arent ready"] = "aren't ready",
+    
+    ["alot"] = "a lot",
+    ["aswell"] = "as well",
+    ["infront"] = "in front",
+    ["atleast"] = "at least",
+    ["everytime"] = "every time",
+    ["incase"] = "in case",
+    ["inspite"] = "in spite",
+    ["nevermind"] = "never mind"
+}
+
+local function applyGrammarFix(text)
+    if not text or text == "" then return text end
+    if not config.grammarFix then return text end
+    local result = text
+    for wrong, correct in pairs(grammarRules) do
+        result = result:gsub(wrong, correct)
+    end
+    return result
+end
+
+-- ============================================
+-- ✅ AI VERIFY TEXT (Master Function)
+-- ============================================
+local function aiVerifyText(text, lang)
+    if not config.smartContext then return text end
+    if not text or text == "" then return text end
+    
+    text = cleanDuplicates(text)
+    
+    if lang == "ur-PK" then
+        for wrong, correct in pairs(urduSpellingFix) do
+            text = text:gsub(wrong, correct)
+        end
+    elseif lang == "hi-IN" then
+        for wrong, correct in pairs(hindiSpellingFix) do
+            text = text:gsub(wrong, correct)
+        end
+    elseif lang == "ar-SA" then
+        for wrong, correct in pairs(arabicSpellingFix) do
+            text = text:gsub(wrong, correct)
+        end
+    elseif lang == "en-US" then
+        -- ✅ Word Checker pehle (sirf galat words)
+        if config.wordChecker then
+            text = applyWordChecker(text)
+        end
+        -- ✅ Spelling Fix (agar enabled)
+        if config.spellingFix then
+            for wrong, correct in pairs(englishSpellingFix) do
+                local pattern = "(%f[%a])" .. wrong .. "(%f[%W])"
+                text = text:gsub(pattern, function(p, s) return p .. correct .. s end)
+            end
+            for pattern, replacement in pairs(englishContextFix) do
+                text = text:gsub(pattern, replacement)
+            end
+        end
+    end
+    
+    return text
+end
+
+-- ============================================
+-- 📝 ENGLISH LEVEL VOCABULARY (Powerful)
+-- ============================================
+local simpleEnglishVocab = {
+    ["utilize"] = "use", ["commence"] = "start", ["terminate"] = "end",
+    ["approximately"] = "about", ["assistance"] = "help", ["purchase"] = "buy",
+    ["obtain"] = "get", ["require"] = "need", ["demonstrate"] = "show",
+    ["sufficient"] = "enough", ["attempt"] = "try", ["regarding"] = "about",
+    ["subsequently"] = "later", ["nevertheless"] = "still", ["furthermore"] = "also",
+    ["additionally"] = "also", ["consequently"] = "so", ["however"] = "but",
+    ["facilitate"] = "help", ["implement"] = "do", ["initiate"] = "start",
+    ["numerous"] = "many", ["optimal"] = "best", ["prior"] = "before"
+}
+
+local modernEnglishVocab = {
+    ["use"] = "utilize", ["start"] = "commence", ["end"] = "terminate",
+    ["help"] = "assist", ["buy"] = "purchase", ["get"] = "obtain",
+    ["need"] = "require", ["show"] = "demonstrate", ["try"] = "attempt",
+    ["also"] = "furthermore", ["but"] = "however", ["so"] = "consequently",
+    ["do"] = "implement", ["many"] = "numerous", ["best"] = "optimal",
+    ["before"] = "prior to", ["after"] = "subsequent to", ["about"] = "regarding"
+}
+
+local function aiRewriteEnglish(text, level, callback)
+    if not text or text == "" then callback(text); return end
+    if level == "standard" then callback(text); return end
+    
+    local words = {}
+    for word in text:gmatch("%S+") do table.insert(words, word) end
+    local tbl = (level == "simple") and simpleEnglishVocab or modernEnglishVocab
+    for i, word in ipairs(words) do
+        local lower = word:lower()
+        local punct = ""
+        local clean = lower:gsub("^%W+", ""):gsub("%W+$", "")
+        if clean ~= lower then punct = lower:match("%W+$") or ""; lower = clean end
+        if tbl[lower] then
+            local rep = tbl[lower]
+            if word:sub(1,1):match("%u") then rep = rep:sub(1,1):upper() .. rep:sub(2) end
+            words[i] = rep .. punct
+        end
+    end
+    callback(table.concat(words, " "))
+end
+
+-- ============================================
+-- ✅ AUTO-CORRECT (All Languages)
+-- ============================================
+local englishAutoCorrect = {
+  ["teh"] = "the", ["recieve"] = "receive", ["adn"] = "and",
+  ["waht"] = "what", ["taht"] = "that", ["wich"] = "which",
+  ["beacuse"] = "because", ["freind"] = "friend"
+}
+local urduAutoCorrect = {
+  ["اورر"] = "اور", ["ہےے"] = "ہے", ["میںں"] = "میں",
+  ["نہییں"] = "نہیں", ["کیی"] = "کی"
+}
+local hindiAutoCorrect = {
+  ["औरर"] = "और", ["हैै"] = "है", ["मैंं"] = "मैं"
+}
+local arabicAutoCorrect = {
+  ["الال"] = "ال", ["منن"] = "من"
+}
+
+-- ============================================
+-- ✅ PUNCTUATION RULES (9 Languages)
+-- ============================================
+local punctuationRules = {
+  ["en-US"] = {sentence_end = ".", question_end = "?", comma = ","},
+  ["ur-PK"] = {sentence_end = "۔", question_end = "؟", comma = "،"},
+  ["hi-IN"] = {sentence_end = "۔", question_end = "؟", comma = "،"},
+  ["ar-SA"] = {sentence_end = "۔", question_end = "؟", comma = "،"},
+  ["pa-IN"] = {sentence_end = "۔", question_end = "؟", comma = "،"},
+  ["ru-RU"] = {sentence_end = ".", question_end = "?", comma = ","},
+  ["fr-FR"] = {sentence_end = ".", question_end = "?", comma = ","},
+  ["es-ES"] = {sentence_end = ".", question_end = "?", comma = ","},
+  ["zh-CN"] = {sentence_end = "。", question_end = "？", comma = "，"}
+}
+
+local questionRules = {
+  ["en-US"] = {startWords = {"what", "why", "how", "when", "where", "who", "which",
+                  "can", "could", "would", "should", "will", "is", "are", "am", "do", "does", "did"}, 
+               strongWords = {}},
+  ["ur-PK"] = {startWords = {"کیوں", "کیسے", "کب", "کہاں", "کون", "کس"},
+               strongWords = {"کیا", "کیا ہے", "کیا ہو", "کیا ہوا"}},
+  ["hi-IN"] = {startWords = {"क्यों", "कैसे", "कब", "कहाँ", "कौन", "किस"},
+               strongWords = {"क्या", "क्या है"}},
+  ["ar-SA"] = {startWords = {"لماذا", "كيف", "متى", "أين", "من"},
+               strongWords = {"ما", "ماذا", "هل"}},
+  ["pa-IN"] = {startWords = {"کیوں", "کیویں", "کدوں", "کِتھے", "کون"},
+               strongWords = {"کی", "کیا"}},
+  ["ru-RU"] = {startWords = {"почему", "как", "где", "кто", "когда", "что"}, strongWords = {}},
+  ["fr-FR"] = {startWords = {"pourquoi", "comment", "où", "qui", "quand"}, strongWords = {}},
+  ["es-ES"] = {startWords = {"por qué", "cómo", "dónde", "quién", "cuándo"}, strongWords = {}},
+  ["zh-CN"] = {startWords = {"为什么", "怎么", "哪里", "谁"}, strongWords = {}}
+}
+
+local function deepPunctuationAnalysis(text, lang)
+  if not text or text == "" then return text end
+  if not config.autoPunc then return text end
+  
+  local rules = punctuationRules[lang] or punctuationRules["en-US"]
+  local qRules = questionRules[lang] or questionRules["en-US"]
+  local result = text
+  
+  if result:find("[.!?؟!۔،。？]%s*$") then return result end
+  
+  local low = result:lower()
+  local firstWord = low:match("^(%S+)") or ""
+  firstWord = firstWord:gsub("^[%p%s]+", ""):gsub("[%p%s]+$", "")
+  local isQuestion = false
+  
+  for _, qw in ipairs(qRules.startWords or {}) do
+    if firstWord == qw:lower() then isQuestion = true; break end
+  end
+  
+  if not isQuestion then
+    for _, qw in ipairs(qRules.strongWords or {}) do
+      local qwLow = qw:lower()
+      if low == qwLow or low:find("^" .. qwLow .. "%s") or low:find("%s" .. qwLow .. "%s") then
+        isQuestion = true; break
+      end
+    end
+  end
+  
+  if not isQuestion and low:find("[?؟？]") then isQuestion = true end
+  
+  if isQuestion then
+    result = result .. rules.question_end
+  else
+    result = result .. rules.sentence_end
+  end
+  
+  return result
+end
+
+-- ============================================
+-- 😊 POWERFUL EMOJI SYSTEM (25+ Categories)
+-- ============================================
+local function deepContextEmojiDetect(text)
+    if not config.useEmoji then return "" end
+    local low = text:lower()
+    
+    if low:find("salam") or low:find("السلام") or low:find("hello") or low:find("hi ") then return "🖐️" end
+    if low:find("good morning") then return "🌅" end
+    if low:find("good night") then return "🌙" end
+    if low:find("good evening") then return "🌆" end
+    if low:find("welcome") then return "🤗" end
+    if low:find("goodbye") or low:find("khuda hafiz") or low:find("خدا حافظ") then return "👋" end
+    if low:find("shukria") or low:find("شکریہ") or low:find("thanks") or low:find("thank you") then return "🙏" end
+    if low:find("mubarak") or low:find("مبارک") or low:find("congrat") then return "🎉" end
+    if low:find("happy birthday") then return "🎂" end
+    if low:find("khush") or low:find("خوش") or low:find("happy") or low:find("great") then return "😊" end
+    if low:find("amazing") or low:find("excellent") or low:find("perfect") then return "🌟" end
+    if low:find("pyar") or low:find("محبت") or low:find("love") then return "❤️" end
+    if low:find("miss") or low:find("یاد") then return "💭" end
+    if low:find("afsos") or low:find("افسوس") or low:find("sad") or low:find("sorry") then return "😢" end
+    if low:find("cry") or low:find("رونا") then return "😭" end
+    if low:find("theek") or low:find("ٹھیک") or low:find("okay") or low:find("ok ") then return "👍" end
+    if low:find("done") or low:find("ho gaya") then return "✅" end
+    if low:find("khana") or low:find("کھانا") or low:find("food") or low:find("eat") then return "🍽️" end
+    if low:find("chai") or low:find("چائے") or low:find("tea") then return "☕" end
+    if low:find("pani") or low:find("پانی") or low:find("water") then return "💧" end
+    if low:find("?") or low:find("؟") then return "❓" end
+    if low:find("paisa") or low:find("پیسہ") or low:find("money") then return "💰" end
+    if low:find("time") or low:find("وقت") then return "⏰" end
+    if low:find("travel") or low:find("سفر") then return "✈️" end
+    if low:find("namaz") or low:find("نماز") or low:find("pray") then return "🕌" end
+    
+    return ""
+end
+
+-- ============================================
+-- ✅ TEXT PROCESSING
+-- ============================================
+local function cleanText(text)
+  if not text then return "" end
+  return text:gsub("[%[%]{}()<>]", "")
+             :gsub("[%*%_%~]", "")
+             :gsub("[ \t]+", " ")
+             :gsub("^%s+", "")
+             :gsub("%s+$", "")
+end
+
+local function applyAutoCorrect(text, lang)
+  if not text then return "" end
+  local result = text
+  local tbl = nil
+  if lang == "en-US" then tbl = englishAutoCorrect
+  elseif lang == "ur-PK" then tbl = urduAutoCorrect
+  elseif lang == "hi-IN" then tbl = hindiAutoCorrect
+  elseif lang == "ar-SA" then tbl = arabicAutoCorrect
+  end
+  if tbl then
+    for wrong, correct in pairs(tbl) do
+      local pattern = "(%f[%a])" .. wrong:gsub("(%W)", "%%%1") .. "(%f[%W])"
+      result = result:gsub(pattern, function(p, s) return p .. correct .. s end)
+    end
+  end
+  return result
+end
+
+local function applyFinalTouches(text, lang)
+  local result = text
+  result = deepPunctuationAnalysis(result, lang)
+  
+  if config.useEmoji then
+    local emoji = deepContextEmojiDetect(result)
+    if emoji ~= "" then result = result .. " " .. emoji end
+  end
+  
+  result = cleanText(result)
+  if lang == "en-US" and #result > 0 then
+    local fc = result:sub(1,1)
+    if fc:match("%a") then result = fc:upper() .. result:sub(2) end
+  end
+  return result
+end
+
+-- ============================================
+-- 🧠 MAIN AI PROCESSING (Translation-Focused)
+-- ============================================
+local function processTextWithAILevel(text, lang, callback)
+  if not text or text == "" then callback(""); return end
+  
+  -- Step 1: AI Verify (spelling, context, duplicates, word checker)
+  text = aiVerifyText(text, lang)
+  
+  -- Step 2: Clean
+  local result = cleanText(text)
+  
+  -- Step 3: Auto-correct
+  result = applyAutoCorrect(result, lang)
+  
+  -- Step 4: Grammar Fix — Sirf agar user ne enable kiya
+  if lang == "en-US" and config.grammarFix and config.aiRewriteEnabled then
+    result = applyGrammarFix(result)
+  end
+  
+  -- Step 5: English-specific fixes
+  if lang == "en-US" then
+    result = repairMergedWords(result)
+    result = fixApostrophes(result)
+    result = smartSpaceInsertion(result)
+  end
+  
+  -- Step 6: AI Rewrite — Sirf agar user ne enable kiya
+  if lang == "en-US" and config.englishLevel ~= "standard" and config.aiRewriteEnabled then
+    local withPunc = applyFinalTouches(result, lang)
+    aiRewriteEnglish(withPunc, config.englishLevel, function(rewritten)
+      callback(rewritten or withPunc)
+    end)
+  else
+    local final = applyFinalTouches(result, lang)
+    callback(final)
+  end
+end-- ============================================
+-- 🎯 PENDING JOB SYSTEM
+-- ============================================
+local pendingJob = nil
+
+local function insertTextDirect(editTextRef, text)
+    if not editTextRef then 
+        speak("Text box not found")
+        return false 
+    end
+    local clean = cleanText(text)
+    local success = pcall(function()
+        local currentText = ""
+        pcall(function() currentText = editTextRef.getText().toString() end)
+        if currentText and currentText ~= "" then
+            service.insertText(editTextRef, " " .. clean)
+        else
+            service.insertText(editTextRef, clean)
+        end
+    end)
+    return success
+end
+
+-- ============================================
+-- 🎯 SCHEDULE PENDING TRANSLATION
+-- ============================================
+local function schedulePendingTranslation(text, src, tgt, mode, capturedEditText)
+    if not text or text == "" then return end
+    pendingJob = {
+        text = text, src = src, tgt = tgt, mode = mode,
+        editText = capturedEditText
+    }
+    
+    mainHandler.postDelayed(function()
+        local job = pendingJob
+        if not job then return end
+        pendingJob = nil
+        if not job.editText then
+            speak("Text box lost. Please tap on text box again.")
+            return
+        end
+        
+        if job.mode == "translate" then
+            if not isNetworkAvailable() then
+                speak("No internet. Please turn on WiFi or data.")
+                return
+            end
+            
+            speak("Translating")
+            
+            mainHandler.postDelayed(function()
+                chunkedTranslate(job.text, job.src, job.tgt, function(translated, engine)
+                    if translated and translated ~= "" then
+                        pcall(function()
+                            autoLearnWords(job.text, translated, job.src, job.tgt)
+                        end)
+                        
+                        local finalText = translated
+                        
+                        processTextWithAILevel(finalText, job.tgt, function(processed)
+                            mainHandler.postDelayed(function()
+                                local ok = insertTextDirect(job.editText, processed)
+                                if ok and config.readAfterType then 
+                                    speak(processed)
+                                elseif ok then
+                                    speak("Text added")
+                                end
+                            end, 50)
+                        end)
+                    else
+                        speak("Translation failed. Please try again.")
+                    end
+                end)
+            end, 100)
+        else
+            processTextWithAILevel(job.text, job.src, function(processed)
+                mainHandler.postDelayed(function()
+                    local ok = insertTextDirect(job.editText, processed)
+                    if ok and config.readAfterType then 
+                        speak(processed) 
+                    elseif ok then
+                        speak("Text added")
+                    end
+                end, 50)
+            end)
+        end
+    end, 300)
+end
+
+-- ============================================
+-- VOICE RECOGNITION STATE
+-- ============================================
+local currentRecognizer = nil
+local isListening = false
+local silenceTimer = nil
+local lastPartialText = ""
+local SILENCE_DURATION = 1500
+local isTranslating = false
+
+local function resetSilenceTimer(recognizer)
+  if silenceTimer then mainHandler.removeCallbacks(silenceTimer); silenceTimer = nil end
+  silenceTimer = Runnable{
+    run = function()
+      if isListening and recognizer and not isTranslating then 
+          pcall(function() recognizer.stopListening() end) 
+      end
+      silenceTimer = nil
+    end
+  }
+  mainHandler.postDelayed(silenceTimer, SILENCE_DURATION)
+end
+
+local function cleanupOldRecognizer()
+    if silenceTimer then 
+        mainHandler.removeCallbacks(silenceTimer)
+        silenceTimer = nil 
+    end
+    if currentRecognizer then
+        pcall(function() currentRecognizer.stopListening() end)
+        pcall(function() currentRecognizer.cancel() end)
+        pcall(function() currentRecognizer.destroy() end)
+        currentRecognizer = nil
+    end
+    isListening = false
+    lastPartialText = ""
+    isTranslating = false
+end
+-- ============================================
+-- 🎤 START VOICE RECOGNITION
+-- ============================================
+function startVoice(lang)
+    cleanupOldRecognizer()
+    
+    if not service then 
+        speak("Service not available. Please turn on accessibility service.")
+        return 
+    end
+    
+    local editText = service.getEditText()
+    if not editText then 
+        speak("Please open a text box first. Tap on any text box.")
+        return 
+    end
+    
+    local isDynamicTranslate = (lang == "__DYNAMIC_TRANSLATE__")
+    local actualLang = lang
+    local srcLang, tgtLang = config.sourceLang, config.targetLang
+    
+    if isDynamicTranslate then
+        if not isNetworkAvailable() then
+            speak("No internet. Please turn on WiFi or data.")
+            return
+        end
+        actualLang = getAndroidLocale(srcLang)
+    end
+    
+    local srcName = getLangName(srcLang)
+    local tgtName = getLangName(tgtLang)
+    
+    if isDynamicTranslate then
+        speak(srcName .. " to " .. tgtName .. " translation mode.")
+    elseif actualLang == "ur-PK" then
+        speak("Urdu typing mode.")
+    elseif actualLang == "hi-IN" then
+        speak("Hindi typing mode.")
+    elseif actualLang == "ar-SA" then
+        speak("Arabic typing mode.")
+    elseif actualLang == "pa-IN" then
+        speak("Punjabi typing mode.")
+    elseif actualLang == "en-US" then
+        speak("English typing mode.")
+    else
+        speak("Listening")
+    end
+    
+    local recognizer = SpeechRecognizer.createSpeechRecognizer(this)
+    if not recognizer then 
+        speak("Speech not available")
+        return 
+    end
+    
+    currentRecognizer = recognizer
+    isListening = true
+    lastPartialText = ""
+    pendingJob = nil
+    isTranslating = false
+    
+    local intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+    intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, actualLang)
+    intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+    intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+    intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+    intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 500)
+    intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1000)
+    intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1500)
+    intent.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, this.getPackageName())
+    
+    local callbacks = RecognitionListener{
+        onReadyForSpeech = function() end,
+        onResults = function(data)
+            if silenceTimer then mainHandler.removeCallbacks(silenceTimer); silenceTimer = nil end
+            local capturedIsDynamic = isDynamicTranslate
+            local capturedSrcLang = srcLang
+            local capturedTgtLang = tgtLang
+            local capturedActualLang = actualLang
+            
+            local capturedEditText = service.getEditText()
+            if not capturedEditText then
+                speak("Text box lost. Please tap on text box again.")
+                isListening = false
+                pcall(function()
+                    if currentRecognizer == recognizer then currentRecognizer = nil end
+                    recognizer.destroy()
+                end)
+                return
+            end
+            
+            local matches = nil
+            pcall(function() matches = data.getParcelableArrayList(SpeechRecognizer.RESULTS_RECOGNITION) end)
+            if not matches then
+                pcall(function() matches = data.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) end)
+            end
+            
+            local recognizedText = nil
+            if matches and matches.size() > 0 then recognizedText = matches.get(0) end
+            if (not recognizedText or recognizedText == "") and lastPartialText and lastPartialText ~= "" then
+                recognizedText = lastPartialText
+            end
+            if not recognizedText or recognizedText == "" then
+                speak("No speech detected. Please try again.")
+                isListening = false
+                pcall(function()
+                    if currentRecognizer == recognizer then currentRecognizer = nil end
+                    recognizer.destroy()
+                end)
+                return
+            end
+            
+            isListening = false
+            isTranslating = true
+            
+            local finalText = recognizedText
+            local finalSrc = capturedIsDynamic and capturedSrcLang or capturedActualLang
+            local finalTgt = capturedIsDynamic and capturedTgtLang or capturedActualLang
+            local finalMode = capturedIsDynamic and "translate" or "typing"
+            
+            schedulePendingTranslation(finalText, finalSrc, finalTgt, finalMode, capturedEditText)
+            
+            mainHandler.postDelayed(function()
+                pcall(function()
+                    if currentRecognizer == recognizer then currentRecognizer = nil end
+                    recognizer.destroy()
+                end)
+                isTranslating = false
+            end, 3000)
+        end,
+        onPartialResults = function(data)
+            local partials = nil
+            pcall(function() partials = data.getParcelableArrayList(SpeechRecognizer.RESULTS_RECOGNITION) end)
+            if not partials then
+                pcall(function() partials = data.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) end)
+            end
+            if partials and partials.size() > 0 then
+                local pt = partials.get(0)
+                if pt and pt ~= "" then 
+                    lastPartialText = pt
+                    resetSilenceTimer(recognizer) 
+                end
+            end
+        end,
+        onError = function(error)
+            if silenceTimer then mainHandler.removeCallbacks(silenceTimer); silenceTimer = nil end
+            
+            if error == 5 or error == SpeechRecognizer.ERROR_CLIENT then
+                if isTranslating then
+                    return
+                end
+            end
+            
+            if lastPartialText and lastPartialText ~= "" and isListening then
+                local capturedEditText = service.getEditText()
+                if capturedEditText then
+                    local capturedIsDynamic = isDynamicTranslate
+                    local capturedSrcLang = srcLang
+                    local capturedTgtLang = tgtLang
+                    local capturedActualLang = actualLang
+                    local finalSrc = capturedIsDynamic and capturedSrcLang or capturedActualLang
+                    local finalTgt = capturedIsDynamic and capturedTgtLang or capturedActualLang
+                    local finalMode = capturedIsDynamic and "translate" or "typing"
+                    isTranslating = true
+                    schedulePendingTranslation(lastPartialText, finalSrc, finalTgt, finalMode, capturedEditText)
+                    mainHandler.postDelayed(function() isTranslating = false end, 3000)
+                end
+            end
+            
+            isListening = false
+            pcall(function()
+                if currentRecognizer == recognizer then currentRecognizer = nil end
+                recognizer.destroy()
+            end)
+            return
+        end,
+        onEndOfSpeech = function() 
+            if isListening and not isTranslating and currentRecognizer == recognizer then
+                mainHandler.postDelayed(function()
+                    if isListening and not isTranslating and currentRecognizer == recognizer then
+                        pcall(function()
+                            recognizer.startListening(intent)
+                        end)
+                    end
+                end, 1000)
+            end
+        end,
+        onBufferReceived = function(buffer) 
+            if isListening and not isTranslating then resetSilenceTimer(recognizer) end 
+        end
+    }
+    
+    recognizer.setRecognitionListener(callbacks)
+    recognizer.startListening(intent)
+end
+
+function stopVoice()
+  cleanupOldRecognizer()
+end
+
+-- ============================================
+-- TYPING MONITOR
+-- ============================================
+local lastText = ""
+local typingTimer = nil
+local isTyping = false
+local typingHandler = Handler(Looper.getMainLooper())
+
+function checkTypingState()
+  if not service then return end
+  local et = service.getEditText()
+  if not et then return end
+  local text = et.getText().toString()
+  if text ~= lastText then
+    if not isTyping then
+      isTyping = true
+      if typingSettings.announceTypingStart then speak("Typing started") end
+    end
+    if typingTimer then typingHandler.removeCallbacks(typingTimer) end
+    typingTimer = Runnable{
+      run = function()
+        if isTyping then
+          isTyping = false
+          if typingSettings.announceTypingEnd then speak("Typing ended") end
+          typingTimer = nil
+        end
+      end
+    }
+    typingHandler.postDelayed(typingTimer, 2000)
+    lastText = text
+  end
+end
+
+function startTypingMonitor()
+  if not service then return end
+  local monitor = Runnable{
+    run = function()
+      if service and service.getEditText() then checkTypingState() end
+      if service then typingHandler.postDelayed(monitor, 500) end
+    end
+  }
+  typingHandler.postDelayed(monitor, 500)
+end
+-- ============================================
+-- 🔍 FULL SYSTEM TEST
+-- ============================================
+local function runFullSystemTest()
+    speak("Running full system test")
+    
+    local results = {}
+    local passCount = 0
+    local failCount = 0
+    
+    local function record(label, ok, note)
+        table.insert(results, {l = label, ok = ok, n = note or ""})
+        if ok then passCount = passCount + 1 else failCount = failCount + 1 end
+    end
+    
+    record("Internet", isNetworkAvailable(), isNetworkAvailable() and "Connected" or "Not connected")
+    record("Voice System", tts and ttsReady, ttsReady and "Ready" or "Not ready")
+    record("Accessibility", service ~= nil, service and "Active" or "Not active")
+    
+    local gTest = httpGetWithStatus("https://translate.googleapis.com/translate_a/single?client=gtx&sl=ur&tl=en&dt=t&q=" .. urlEncode("سلام"), 5000)
+    if gTest and gTest.code == 200 and gTest.body then
+        local gRes = gTest.body:match('^%[%[%["(.-)","')
+        if gRes and gRes ~= "" then
+            record("Google Translate", true, "Working")
+        else
+            record("Google Translate", false, "Empty result")
+        end
+    else
+        record("Google Translate", false, "Not working")
+    end
+    
+    local mTest = httpGetWithStatus("https://api.mymemory.translated.net/get?q=hello&langpair=en|ur", 5000)
+    if mTest and mTest.code == 200 and mTest.body then
+        local mRes = mTest.body:match('"translatedText":"(.-)"')
+        if mRes and mRes ~= "" and not mRes:find("WARNING") then
+            record("MyMemory Translate", true, "Working")
+        else
+            record("MyMemory Translate", false, "Empty result")
+        end
+    else
+        record("MyMemory Translate", false, "Not working")
+    end
+    
+    local msTest = engineMicrosoft("hello", "en", "ur")
+    if msTest and msTest ~= "" then
+        record("Microsoft Translate", true, "Working")
+    else
+        record("Microsoft Translate", false, "Not working")
+    end
+    
+    if scoreTranslation and type(scoreTranslation) == "function" then
+        local testScore = scoreTranslation("Hello world test", "en", "ur", "hello world test")
+        if testScore > -1000 then
+            record("Smart Choice", true, "Working")
+        else
+            record("Smart Choice", false, "Not working")
+        end
+    else
+        record("Smart Choice", false, "Not loaded")
+    end
+    
+    if punctuationRules and punctuationRules["en-US"] and punctuationRules["ur-PK"] then
+        record("Punctuation", true, "9 languages")
+    else
+        record("Punctuation", false, "Not loaded")
+    end
+    
+    if deepContextEmojiDetect and type(deepContextEmojiDetect) == "function" then
+        local testEmoji = deepContextEmojiDetect("hello salam")
+        if testEmoji and testEmoji ~= "" then
+            record("Emoji System", true, "Working")
+        else
+            record("Emoji System", false, "Not working")
+        end
+    else
+        record("Emoji System", false, "Not loaded")
+    end
+    
+    if aiVerifyText and type(aiVerifyText) == "function" then
+        local fixed = aiVerifyText("teh quikc brown", "en-US")
+        if fixed and fixed ~= "" then
+            record("Text Fixing", true, "Working")
+        else
+            record("Text Fixing", false, "Not working")
+        end
+    else
+        record("Text Fixing", false, "Not loaded")
+    end
+    
+    if repairMergedWords and type(repairMergedWords) == "function" then
+        local r = repairMergedWords("iam gonna wanto go")
+        if r and r:find("I am") then
+            record("Word Joining Fix", true, "Working")
+        else
+            record("Word Joining Fix", false, "Not working")
+        end
+    else
+        record("Word Joining Fix", false, "Not loaded")
+    end
+    
+    if fixApostrophes and type(fixApostrophes) == "function" then
+        local a = fixApostrophes("dont cant")
+        if a and a:find("don't") then
+            record("Apostrophe Fix", true, "Working")
+        else
+            record("Apostrophe Fix", false, "Not working")
+        end
+    else
+        record("Apostrophe Fix", false, "Not loaded")
+    end
+    
+    if applyGrammarFix and type(applyGrammarFix) == "function" then
+        local g = applyGrammarFix("i is going")
+        if g and g:find("I am") then
+            record("Grammar Fix", true, "Working")
+        else
+            record("Grammar Fix", false, "Not working")
+        end
+    else
+        record("Grammar Fix", false, "Not loaded")
+    end
+    
+    if applyWordChecker and type(applyWordChecker) == "function" then
+        local w = applyWordChecker("side poetry said")
+        if w and w:find("side") and w:find("poetry") then
+            record("Word Checker", true, "Working")
+        else
+            record("Word Checker", false, "Not working")
+        end
+    else
+        record("Word Checker", false, "Not loaded")
+    end
+    
+    local testTranslated = nil
+    local testEngine = nil
+    if isNetworkAvailable() then
+        pcall(function()
+            multiAITranslate("سلام", "ur", "en", function(tr, eng)
+                testTranslated = tr
+                testEngine = eng
+            end)
+        end)
+        if testTranslated and testTranslated ~= "" then
+            record("Translation Flow", true, "Via " .. tostring(testEngine))
+        else
+            record("Translation Flow", false, "Not working")
+        end
+    else
+        record("Translation Flow", false, "No internet")
+    end
+    
+    if autoLearnWords and type(autoLearnWords) == "function" then
+        record("Auto-Learning", true, "Loaded")
+    else
+        record("Auto-Learning", false, "Not loaded")
+    end
+    
+    if translationLangs and #translationLangs == 9 then
+        record("Languages", true, "9 loaded")
+    else
+        record("Languages", false, tostring(#(translationLangs or {})) .. " loaded")
+    end
+    
+    local hasInput = false
+    if service then
+        local et = service.getEditText()
+        if et then hasInput = true end
+    end
+    record("Text Box", hasInput, hasInput and "Ready" or "Tap on text box")
+    
+    local vr = nil
+    pcall(function() vr = SpeechRecognizer.createSpeechRecognizer(this) end)
+    if vr then
+        record("Voice Input", true, "Ready")
+        pcall(function() vr.destroy() end)
+    else
+        record("Voice Input", false, "Not available")
+    end
+    
+    local dictTotal = getWordCount("ur-PK") + getWordCount("en-US") + getWordCount("hi-IN") + getWordCount("pa-IN") + getWordCount("ar-SA")
+    record("Dictionary", dictTotal > 0, dictTotal .. " words")
+    
+    local storageOk = false
+    pcall(function()
+        pref.edit().putBoolean("chk_test", true).apply()
+        storageOk = pref.getBoolean("chk_test", false)
+    end)
+    record("Storage", storageOk, storageOk and "Saved" or "Not saved")
+    
+    local txt = "🔍 Full System Test\n\n"
+    txt = txt .. "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    for i, r in ipairs(results) do
+        txt = txt .. (r.ok and "  ✅ " or "  ❌ ") .. r.l .. " — " .. r.n .. "\n"
+    end
+    txt = txt .. "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    txt = txt .. "📊 Summary\n"
+    txt = txt .. "  Total Tests: " .. (passCount + failCount) .. "\n"
+    txt = txt .. "  ✅ Passed: " .. passCount .. "\n"
+    txt = txt .. "  ❌ Failed: " .. failCount .. "\n"
+    if failCount == 0 then
+        txt = txt .. "\n✅ All systems working!"
+    else
+        txt = txt .. "\n⚠️ " .. failCount .. " problem found."
+    end
+    
+    if failCount == 0 then
+        speak("All " .. passCount .. " tests passed")
+    else
+        speak(passCount .. " tests passed. " .. failCount .. " failed.")
+    end
+    
+    local test_dlg = LuaDialog(this).setTitle("Full System Test")
+    local scroll = ScrollView(this)
+    local tv = TextView(this)
+    tv.setText(txt)
+    tv.setTextSize(14)
+    tv.setPadding(40, 40, 40, 40)
+    scroll.addView(tv)
+    test_dlg.setView(scroll)
+    test_dlg.setPositiveButton("Close", function() speak("Test complete") end)
+    test_dlg.show()
+end
+
+-- ============================================
+-- 📚 DICTIONARY EDITOR
+-- ============================================
+function showDictionaryEditor()
+    speak("Dictionary opened")
+    
+    local dict_dlg = LuaDialog(this).setTitle("📚 Dictionary")
+    local d_layout = LinearLayout(this).setOrientation(1).setPadding(40,40,40,40)
+    
+    local totalText = TextView(this)
+    local total = getWordCount("ur-PK") + getWordCount("en-US") + getWordCount("hi-IN") + getWordCount("pa-IN") + getWordCount("ar-SA")
+    totalText.setText("Total words: " .. total)
+    totalText.setTextSize(16)
+    totalText.setTextColor(0xFF2196F3)
+    totalText.setGravity(Gravity.CENTER)
+    totalText.setPadding(0,0,0,20)
+    d_layout.addView(totalText)
+    
+    local langNames = {
+        {"ur-PK", "Urdu — " .. getWordCount("ur-PK") .. " words"},
+        {"en-US", "English — " .. getWordCount("en-US") .. " words"},
+        {"hi-IN", "Hindi — " .. getWordCount("hi-IN") .. " words"},
+        {"pa-IN", "Punjabi — " .. getWordCount("pa-IN") .. " words"},
+        {"ar-SA", "Arabic — " .. getWordCount("ar-SA") .. " words"}
+    }
+    
+    local namesList = {}
+    for _, item in ipairs(langNames) do
+        table.insert(namesList, item[2])
+    end
+    
+    local langList = ListView(this)
+    langList.setAdapter(ArrayAdapter(this, android.R.layout.simple_list_item_1, namesList))
+    
+    langList.onItemClick = function(adapter, view, position, id)
+        local selectedLang = langNames[position + 1][1]
+        dict_dlg.dismiss()
+        mainHandler.postDelayed(function()
+            showWordList(selectedLang)
+        end, 300)
+    end
+    
+    d_layout.addView(langList)
+    
+    dict_dlg.setView(d_layout)
+    dict_dlg.setPositiveButton("Close", function() speak("Dictionary closed") end)
+    dict_dlg.show()
+end
+
+-- ============================================
+-- 📖 WORD LIST (Search + Add + Delete)
+-- ============================================
+function showWordList(lang)
+    local langDisplayName = "Language"
+    for _, l in ipairs(translationLangs) do
+        if l.code == lang then langDisplayName = l.name end
+    end
+    speak("Showing " .. langDisplayName .. " words")
+    
+    local word_dlg = LuaDialog(this).setTitle("Words — " .. langDisplayName)
+    local w_layout = LinearLayout(this).setOrientation(1).setPadding(40,40,40,40)
+    
+    local searchBox = EditText(this)
+    searchBox.setHint("Search word...")
+    searchBox.setSingleLine(true)
+    w_layout.addView(searchBox)
+    
+    local countText = TextView(this)
+    countText.setText("Total: " .. getWordCount(lang) .. " words")
+    countText.setTextSize(13)
+    countText.setTextColor(0xFF666666)
+    countText.setPadding(0,10,0,10)
+    w_layout.addView(countText)
+    
+    local listContainer = LinearLayout(this).setOrientation(1)
+    w_layout.addView(listContainer)
+    
+    local function refreshList()
+        listContainer.removeAllViews()
+        
+        local searchTerm = ""
+        pcall(function() searchTerm = searchBox.getText().toString():lower() end)
+        
+        local wordItems = {}
+        for word, meaning in pairs(wordBanks[lang] or {}) do
+            if searchTerm == "" or word:lower():find(searchTerm, 1, true) or meaning:lower():find(searchTerm, 1, true) then
+                table.insert(wordItems, {w = word, m = meaning})
+            end
+        end
+        
+        table.sort(wordItems, function(a, b) return a.w < b.w end)
+        
+        if #wordItems == 0 then
+            local empty = TextView(this)
+            empty.setText("No words found")
+            empty.setTextSize(14)
+            empty.setTextColor(0xFF999999)
+            empty.setGravity(Gravity.CENTER)
+            empty.setPadding(0,40,0,40)
+            listContainer.addView(empty)
+            return
+        end
+        
+        for _, item in ipairs(wordItems) do
+            local row = LinearLayout(this).setOrientation(0)
+            row.setPadding(0,10,0,10)
+            
+            local wordText = TextView(this)
+            wordText.setText(item.w .. " → " .. item.m)
+            wordText.setTextSize(15)
+            wordText.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
+            row.addView(wordText)
+            
+            local delBtn = Button(this)
+            delBtn.setText("❌")
+            delBtn.setTextSize(12)
+            delBtn.setOnClickListener(function()
+                wordBanks[lang][item.w] = nil
+                saveDictionary(lang)
+                speak("Deleted")
+                refreshList()
+                countText.setText("Total: " .. getWordCount(lang) .. " words")
+            end)
+            row.addView(delBtn)
+            
+            listContainer.addView(row)
+        end
+    end
+    
+    searchBox.addTextChangedListener{
+        onTextChanged = function() refreshList() end
+    }
+    
+    w_layout.addView(TextView(this).setText("Add New Word:").setTextSize(15).setTextColor(0xFF000000).setPadding(0,20,0,5))
+    
+    local newWordBox = EditText(this)
+    newWordBox.setHint("New word")
+    newWordBox.setSingleLine(true)
+    w_layout.addView(newWordBox)
+    
+    local newMeaningBox = EditText(this)
+    newMeaningBox.setHint("Meaning")
+    newMeaningBox.setSingleLine(true)
+    w_layout.addView(newMeaningBox)
+    
+    local addBtn = Button(this)
+    addBtn.setText("➕ Add Word")
+    addBtn.setOnClickListener(function()
+        local newWord = ""
+        local newMeaning = ""
+        pcall(function()
+            newWord = newWordBox.getText().toString():gsub("^%s+", ""):gsub("%s+$", "")
+            newMeaning = newMeaningBox.getText().toString():gsub("^%s+", ""):gsub("%s+$", "")
+        end)
+        
+        if newWord == "" or newMeaning == "" then
+            speak("Please type word and meaning")
+            return
+        end
+        
+        if not wordBanks[lang] then wordBanks[lang] = {} end
+        wordBanks[lang][newWord] = newMeaning
+        saveDictionary(lang)
+        speak("Word added")
+        
+        pcall(function()
+            newWordBox.setText("")
+            newMeaningBox.setText("")
+        end)
+        
+        refreshList()
+        countText.setText("Total: " .. getWordCount(lang) .. " words")
+    end)
+    w_layout.addView(addBtn)
+    
+    refreshList()
+    
+    local scroll = ScrollView(this)
+    scroll.addView(w_layout)
+    
+    word_dlg.setView(scroll)
+    word_dlg.setPositiveButton("Close", function() speak("Closed") end)
+    word_dlg.show()
+end
+
+-- ============================================
+-- BUILD LANGUAGE LIST (Menu)
+-- ============================================
+local function buildLangList()
+    return {
+        "English (Typing)",
+        "Urdu (Typing)",
+        "Hindi (Typing)",
+        "Punjabi (Typing)",
+        "Arabic (Typing)",
+        "Translation"
+    }
+end
+
+-- ============================================
+-- MAIN UI
+-- ============================================
+if not IS_FIRST_TIME then
+  pref.edit().putBoolean("first_time_setup_done", true).apply()
+end
+
+local main_dlg = LuaDialog(this)
+local main_lay = LinearLayout(this).setOrientation(1).setPadding(40,40,40,40)
+main_lay.addView(TextView(this).setText(_MAIN_HEADING).setTextSize(18).setGravity(Gravity.CENTER).setPadding(0,0,0,20))
+
+-- ✅ Language List (Menu) — With Language Lock + Translation Fix
+local lang_list = ListView(this)
+lang_list.setAdapter(ArrayAdapter(this, android.R.layout.simple_list_item_1, buildLangList()))
+
+lang_list.onItemClick = function(adapter, view, position, id)
+    local selectedLang
+    local isTranslationMode = false
+    
+    if position == 0 then 
+        selectedLang = "en-US"
+        config.sourceLang = "en"
+        config.targetLang = "en"
+    elseif position == 1 then 
+        selectedLang = "ur-PK"
+        config.sourceLang = "ur"
+        config.targetLang = "ur"
+    elseif position == 2 then 
+        selectedLang = "hi-IN"
+        config.sourceLang = "hi"
+        config.targetLang = "hi"
+    elseif position == 3 then 
+        selectedLang = "pa-IN"
+        config.sourceLang = "pa"
+        config.targetLang = "pa"
+    elseif position == 4 then 
+        selectedLang = "ar-SA"
+        config.sourceLang = "ar"
+        config.targetLang = "ar"
+    elseif position == 5 then 
+        selectedLang = "__DYNAMIC_TRANSLATE__"
+        isTranslationMode = true
+        -- ✅ TRANSLATION FIX: Settings کی values دوبارہ لوڈ کریں
+        config.sourceLang = pref.getString("cfg_sourceLang", "ur")
+        config.targetLang = pref.getString("cfg_targetLang", "en")
+    end
+    
+    -- ✅ LANGUAGE LOCK: Save to preferences (صرف Typing Mode کے لیے)
+    if not isTranslationMode then
+        pref.edit().putString("cfg_sourceLang", config.sourceLang).apply()
+        pref.edit().putString("cfg_targetLang", config.targetLang).apply()
+    end
+    
+    local selectedName = buildLangList()[position + 1]
+    
+    -- ✅ Translation پر مکمل نام بولیں
+    if isTranslationMode then
+        local srcName = getLangName(config.sourceLang)
+        local tgtName = getLangName(config.targetLang)
+        speak("Translation " .. srcName .. " to " .. tgtName)
+    else
+        speak("Selected " .. selectedName)
+    end
+    
+    main_dlg.dismiss()
+    mainHandler.postDelayed(function()
+        startVoice(selectedLang)
+    end, 300)
+end
+
+main_lay.addView(lang_list)
+
+-- ============================================
+-- ⚙️ EXTENSION SETTINGS DIALOG (TTS Rate/Pitch removed)
+-- ============================================
+local btn_set = Button(this).setText("Extension Settings")
+btn_set.setOnClickListener(function()
+  speak("Extension Settings opened")
+  
+  local s_dlg = LuaDialog(this).setTitle("Extension Settings")
+  local scroll = ScrollView(this)
+  local s_lay = LinearLayout(this).setOrientation(1).setPadding(40,40,40,40)
+  
+  local currentModeText = TextView(this)
+  local function updateModeText()
+    currentModeText.setText("Mode: " .. getLangName(config.sourceLang) .. " to " .. getLangName(config.targetLang))
+  end
+  updateModeText()
+  currentModeText.setTextSize(15)
+  currentModeText.setTextColor(0xFF2196F3)
+  currentModeText.setPadding(0,0,0,20)
+  currentModeText.setGravity(Gravity.CENTER)
+  s_lay.addView(currentModeText)
+  
+  -- ═══ SOURCE LANGUAGE SPINNER ═══
+  s_lay.addView(TextView(this).setText("🌐 Translation Settings").setTextSize(17).setTextColor(0xFF000000).setPadding(0,15,0,10))
+  s_lay.addView(TextView(this).setText("I will speak in:").setTextSize(14).setTextColor(0xFF333333).setPadding(0,10,0,5))
+  
+  local srcNames = {}
+  local srcIndex = 1
+  for i, l in ipairs(translationLangs) do
+    table.insert(srcNames, l.name)
+    if l.code == config.sourceLang then srcIndex = i end
+  end
+  local srcSpinner = Spinner(this)
+  srcSpinner.setAdapter(ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, srcNames))
+  srcSpinner.setSelection(srcIndex - 1)
+  s_lay.addView(srcSpinner)
+  
+  -- ═══ TARGET LANGUAGE SPINNER ═══
+  s_lay.addView(TextView(this).setText("Translate into:").setTextSize(14).setTextColor(0xFF333333).setPadding(0,15,0,5))
+  
+  local tgtNames = {}
+  local tgtIndex = 1
+  for i, l in ipairs(translationLangs) do
+    table.insert(tgtNames, l.name)
+    if l.code == config.targetLang then tgtIndex = i end
+  end
+  local tgtSpinner = Spinner(this)
+  tgtSpinner.setAdapter(ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, tgtNames))
+  tgtSpinner.setSelection(tgtIndex - 1)
+  s_lay.addView(tgtSpinner)
+  
+  local function saveLangSelection()
+    local newSrc = translationLangs[srcSpinner.getSelectedItemPosition() + 1].code
+    local newTgt = translationLangs[tgtSpinner.getSelectedItemPosition() + 1].code
+    if newSrc == config.sourceLang and newTgt == config.targetLang then return end
+    config.sourceLang = newSrc
+    config.targetLang = newTgt
+    pref.edit().putString("cfg_sourceLang", newSrc).apply()
+    pref.edit().putString("cfg_targetLang", newTgt).apply()
+    updateModeText()
+    pcall(function()
+      lang_list.setAdapter(ArrayAdapter(this, android.R.layout.simple_list_item_1, buildLangList()))
+    end)
+    speak("Set to " .. getLangName(newSrc) .. " to " .. getLangName(newTgt))
+  end
+  
+  srcSpinner.onItemSelected = function() saveLangSelection() end
+  tgtSpinner.onItemSelected = function() saveLangSelection() end
+  
+  -- ═══ ENGINE SELECTION ═══
+  s_lay.addView(TextView(this).setText("🔧 Translation Engines").setTextSize(17).setTextColor(0xFF000000).setPadding(0,25,0,10))
+  
+  local engineNote = TextView(this)
+  engineNote.setText("If Default is checked, all three engines will run together and the best result will be shown.")
+  engineNote.setTextSize(13); engineNote.setTextColor(0xFF666666); engineNote.setPadding(0,0,0,15)
+  s_lay.addView(engineNote)
+  
+  local cb_default = CheckBox(this).setText("⭐ Default (Best Result — 3 Engines)").setChecked(config.useDefault)
+  cb_default.setOnCheckedChangeListener{onCheckedChanged=function(v, c)
+    config.useDefault = c
+    pref.edit().putBoolean("cfg_useDefault", c).apply()
+    speak("Default " .. (c and "on" or "off"))
+  end}
+  s_lay.addView(cb_default)
+  
+  local cb_google = CheckBox(this).setText("Google Translate").setChecked(config.useGoogle)
+  cb_google.setOnCheckedChangeListener{onCheckedChanged=function(v, c)
+    config.useGoogle = c
+    pref.edit().putBoolean("cfg_useGoogle", c).apply()
+    speak("Google " .. (c and "on" or "off"))
+  end}
+  s_lay.addView(cb_google)
+  
+  local cb_mymemory = CheckBox(this).setText("MyMemory Translate").setChecked(config.useMyMemory)
+  cb_mymemory.setOnCheckedChangeListener{onCheckedChanged=function(v, c)
+    config.useMyMemory = c
+    pref.edit().putBoolean("cfg_useMyMemory", c).apply()
+    speak("MyMemory " .. (c and "on" or "off"))
+  end}
+  s_lay.addView(cb_mymemory)
+  
+  local cb_microsoft = CheckBox(this).setText("Microsoft Translate").setChecked(config.useMicrosoft)
+  cb_microsoft.setOnCheckedChangeListener{onCheckedChanged=function(v, c)
+    config.useMicrosoft = c
+    pref.edit().putBoolean("cfg_useMicrosoft", c).apply()
+    speak("Microsoft " .. (c and "on" or "off"))
+  end}
+  s_lay.addView(cb_microsoft)
+  
+  -- ═══ VOICE OPTIONS ═══
+  s_lay.addView(TextView(this).setText("🎤 Voice Options").setTextSize(17).setTextColor(0xFF000000).setPadding(0,25,0,10))
+  
+  local features = {
+    {"Smart Punctuation", "autoPunc"}, 
+    {"Voice Feedback", "readAfterType"},
+    {"Add Emoji", "useEmoji"},
+    {"Smart Context", "smartContext"},
+    {"Grammar Fix", "grammarFix"},
+    {"Spelling Fix", "spellingFix"},
+    {"Word Checker", "wordChecker"},
+    {"AI Rewrite (Advanced)", "aiRewriteEnabled"},
+    {"Debug Mode", "debugMode"}
+  }
+  for _, f in ipairs(features) do
+    local cb = CheckBox(this).setText(f[1]).setChecked(config[f[2]])
+    cb.setOnCheckedChangeListener{onCheckedChanged=function(v, c)
+      config[f[2]] = c
+      pref.edit().putBoolean("cfg_"..f[2], c).apply()
+      speak(f[1] .. (c and " on" or " off"))
+    end}
+    s_lay.addView(cb)
+  end
+  
+  -- ═══ DICTIONARY ═══
+  s_lay.addView(TextView(this).setText("📚 Dictionary").setTextSize(17).setTextColor(0xFF000000).setPadding(0,25,0,10))
+  
+  local totalWords = getWordCount("ur-PK") + getWordCount("en-US") + getWordCount("hi-IN") + getWordCount("pa-IN") + getWordCount("ar-SA")
+  local dictNote = TextView(this)
+  dictNote.setText("Total words learned: " .. totalWords)
+  dictNote.setTextSize(13); dictNote.setTextColor(0xFF666666); dictNote.setPadding(0,0,0,15)
+  s_lay.addView(dictNote)
+  
+  local btn_dict = Button(this).setText("📚 Open Dictionary")
+  btn_dict.setOnClickListener(function()
+    s_dlg.dismiss()
+    mainHandler.postDelayed(function()
+      showDictionaryEditor()
+    end, 300)
+  end)
+  s_lay.addView(btn_dict)
+  
+  -- ═══ DIAGNOSTICS ═══
+  s_lay.addView(TextView(this).setText("🧪 System Test").setTextSize(17).setTextColor(0xFF000000).setPadding(0,25,0,10))
+  
+  local btn_full_test = Button(this).setText("🔍 Run Full System Test")
+  btn_full_test.setOnClickListener(function()
+    s_dlg.dismiss()
+    mainHandler.postDelayed(function()
+      runFullSystemTest()
+    end, 500)
+  end)
+  s_lay.addView(btn_full_test)
+  
+  -- ═══ TYPING ANNOUNCEMENTS ═══
+  s_lay.addView(TextView(this).setText("⌨️ Typing Announcements").setTextSize(17).setTextColor(0xFF000000).setPadding(0,25,0,10))
+  
+  local cb_ts = CheckBox(this).setText("Say when typing starts").setChecked(typingSettings.announceTypingStart)
+  cb_ts.setOnCheckedChangeListener{onCheckedChanged=function(v, c)
+    typingSettings.announceTypingStart = c
+    pref.edit().putBoolean("cfg_announceTypingStart", c).apply()
+    speak(c and "Typing start on" or "Typing start off")
+  end}
+  s_lay.addView(cb_ts)
+  
+  local cb_te = CheckBox(this).setText("Say when typing ends").setChecked(typingSettings.announceTypingEnd)
+  cb_te.setOnCheckedChangeListener{onCheckedChanged=function(v, c)
+    typingSettings.announceTypingEnd = c
+    pref.edit().putBoolean("cfg_announceTypingEnd", c).apply()
+    speak(c and "Typing end on" or "Typing end off")
+  end}
+  s_lay.addView(cb_te)
+  
+  -- ═══ ENGLISH STYLE ═══
+  s_lay.addView(TextView(this).setText("📝 English Style").setTextSize(17).setTextColor(0xFF000000).setPadding(0,25,0,10))
+  
+  local cb_simple = CheckBox(this).setText("Simple English").setChecked(config.englishLevel == "simple")
+  cb_simple.setOnCheckedChangeListener{onCheckedChanged=function(v, c)
+    if c then
+      config.englishLevel = "simple"
+      pref.edit().putString("cfg_englishLevel", "simple").apply()
+      speak("Simple English selected")
+    end
+  end}
+  s_lay.addView(cb_simple)
+  
+  local cb_std = CheckBox(this).setText("Standard English").setChecked(config.englishLevel == "standard")
+  cb_std.setOnCheckedChangeListener{onCheckedChanged=function(v, c)
+    if c then
+      config.englishLevel = "standard"
+      pref.edit().putString("cfg_englishLevel", "standard").apply()
+      speak("Standard English selected")
+    end
+  end}
+  s_lay.addView(cb_std)
+  
+  local cb_mod = CheckBox(this).setText("Modern English").setChecked(config.englishLevel == "modern")
+  cb_mod.setOnCheckedChangeListener{onCheckedChanged=function(v, c)
+    if c then
+      config.englishLevel = "modern"
+      pref.edit().putString("cfg_englishLevel", "modern").apply()
+      speak("Modern English selected")
+    end
+  end}
+  s_lay.addView(cb_mod)
+  
+  -- ═══ SYSTEM INFO ═══
+  s_lay.addView(TextView(this).setText("🔋 System Info").setTextSize(17).setTextColor(0xFF000000).setPadding(0,25,0,10))
+  
+  local btn_bat = Button(this).setText("Say Date, Time, Battery")
+  btn_bat.setOnClickListener(function() 
+    speak("Reading information")
+    announceBatteryAndTime() 
+  end)
+  s_lay.addView(btn_bat)
+  
+  scroll.addView(s_lay)
+  s_dlg.setView(scroll)
+  s_dlg.setPositiveButton("Save", function()
+    speak("Settings saved")
+  end)
+  s_dlg.show()
+end)
+main_lay.addView(btn_set)
+
+-- ============================================
+-- ℹ️ INFORMATION AND ABOUT DIALOG
+-- ============================================
+local btn_ab = Button(this).setText("Information and About")
+btn_ab.setOnClickListener(function()
+  speak("Information and About opened")
+  
+  local ab_dlg = LuaDialog(this).setTitle("Information and About")
+  local al = LinearLayout(this).setOrientation(1).setPadding(40,40,40,40)
+  
+  al.addView(TextView(this).setText(_DESC_TEXT).setPadding(0,0,0,20))
+  
+  local btn_yt = Button(this).setText("Visit YouTube Channel")
+  btn_yt.setOnClickListener(function() 
+    speak("Opening YouTube")
+    ab_dlg.dismiss()
+    mainHandler.postDelayed(function()
+      this.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(_YT_URL)))
+    end, 300)
+  end)
+  al.addView(btn_yt)
+  
+  local btn_c = Button(this).setText(_DEV_L1 .. "\n" .. _DEV_L2)
+  btn_c.setOnClickListener(function() 
+    speak("Opening WhatsApp")
+    ab_dlg.dismiss()
+    mainHandler.postDelayed(function()
+      local intent = Intent(Intent.ACTION_VIEW)
+      intent.setData(Uri.parse("https://wa.me/" .. _PHONE))
+      intent.setPackage("com.whatsapp")
+      local pkgManager = this.getPackageManager()
+      local activities = pkgManager.queryIntentActivities(intent, 0)
+      if activities and activities.size() > 0 then
+        this.startActivity(intent)
+      else
+        local webIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://wa.me/" .. _PHONE))
+        this.startActivity(webIntent)
+      end
+    end, 400)
+  end)
+  al.addView(btn_c)
+  
+  ab_dlg.setView(al).setPositiveButton("Close", function()
+    speak("Closed")
+  end).show()
+end)
+main_lay.addView(btn_ab)
+
+-- ============================================
+-- 🚪 EXIT BUTTON
+-- ============================================
+local btn_exit = Button(this).setText("Exit")
+btn_exit.setOnClickListener(function() 
+  speak("Exiting Supreme Typer")
+  stopVoice()
+  mainHandler.postDelayed(function()
+    main_dlg.dismiss()
+  end, 800)
+end)
+main_lay.addView(btn_exit)
+
+-- ============================================
+-- DIALOG SETUP
+-- ============================================
+main_dlg.setView(main_lay)
+main_dlg.setOnDismissListener(function() stopVoice() end)
+main_dlg.setOnShowListener(function()
+  speak("Supreme Typer ready. Mode: " .. getLangName(config.sourceLang) .. " to " .. getLangName(config.targetLang))
+  startTypingMonitor()
+end)
+
+main_dlg.show()
+return true
